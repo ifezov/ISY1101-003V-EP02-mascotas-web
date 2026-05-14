@@ -1,0 +1,18 @@
+services:
+  mascotas-web:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: mascotas-web:latest
+    container_name: mascotas-web
+    environment:
+      BACKEND_HOST: mascotas-app
+    ports:
+      - "80:80"
+    restart: unless-stopped
+    networks:
+      - mascotas-network
+
+networks:
+  mascotas-network:
+    external: true
