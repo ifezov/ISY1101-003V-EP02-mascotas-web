@@ -1,0 +1,172 @@
+name: Frontend CI/CD — Test, Version, ECR, Deploy
+
+on:
+  push:
+    branches: ['**']   # cualquier push a cualquier rama
+
+env:
+  AWS_REGION: us-east-1
+  IMAGE_NAME: mascotas-web
+
+# Permisos necesarios para que github-actions[bot] pueda crear tags
+permissions:
+  contents: write
+
+jobs:
+
+# ─────────────────────────────────────────────────────────────────────────────
+# JOB 1: TEST — si falla, todo se detiene
+# ─────────────────────────────────────────────────────────────────────────────
+  test:
+    name: Tests (cobertura ≥ 90%)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: package.json
+
+      - run: npm install
+
+      - name: Tests con cobertura
+        run: npm run test:coverage
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: coverage-report
+          path: coverage/
+          retention-days: 7
+
+# ─────────────────────────────────────────────────────────────────────────────
+# JOB 2: VERSIONING — calcula v1.x.0 y crea el tag
+# ─────────────────────────────────────────────────────────────────────────────
+  versioning:
+    name: Semantic Version (v1.x.0)
+    runs-on: ubuntu-latest
+    needs: test
+    outputs:
+      new_tag: ${{ steps.calc.outputs.new_tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}   # token con permisos de escritura
+
+      - name: Calcular y crear tag
+        id: calc
+        run: |
+          LAST=$(git tag --list 'v1.*' --sort=-v:refname | head -1)
+          if [ -z "$LAST" ]; then
+            NEW="v1.0.0"
+          else
+            MINOR=$(echo $LAST | cut -d. -f2)
+            NEW="v1.$((MINOR + 1)).0"
+          fi
+          echo "Último: ${LAST:-ninguno} → Nuevo: $NEW"
+          echo "new_tag=$NEW" >> $GITHUB_OUTPUT
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag $NEW
+          git push origin $NEW
+
+# ─────────────────────────────────────────────────────────────────────────────
+# JOB 3: BUILD & PUSH ECR
+# ─────────────────────────────────────────────────────────────────────────────
+  build-push-ecr:
+    name: Build & Push ECR (${{ needs.versioning.outputs.new_tag }})
+    runs-on: ubuntu-latest
+    needs: versioning
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Login ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build y push
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ steps.login-ecr.outputs.registry }}/${{ env.IMAGE_NAME }}:${{ needs.versioning.outputs.new_tag }}
+            ${{ steps.login-ecr.outputs.registry }}/${{ env.IMAGE_NAME }}:latest
+          cache-from: type=gha
+          cache-to:   type=gha,mode=max
+
+# ─────────────────────────────────────────────────────────────────────────────
+# JOB 4: DEPLOY VIA SSM
+# ─────────────────────────────────────────────────────────────────────────────
+  deploy:
+    name: Deploy EC2-Web via SSM
+    runs-on: ubuntu-latest
+    needs: build-push-ecr
+    steps:
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Leer Instance ID desde Parameter Store
+        id: get-instance
+        run: |
+          EC2_WEB=$(aws ssm get-parameter \
+            --name "/mascotas/ec2/web" \
+            --query "Parameter.Value" \
+            --output text)
+          echo "instance_id=$EC2_WEB" >> $GITHUB_OUTPUT
+
+      - name: Enviar deploy via SSM
+        id: ssm-cmd
+        run: |
+          CMD_ID=$(aws ssm send-command \
+            --instance-ids "${{ steps.get-instance.outputs.instance_id }}" \
+            --document-name "AWS-RunShellScript" \
+            --parameters '{"commands":["sudo -u ec2-user /home/ec2-user/deploy-web.sh"]}' \
+            --comment "Deploy ${{ needs.versioning.outputs.new_tag }}" \
+            --timeout-seconds 300 \
+            --query "Command.CommandId" \
+            --output text)
+          echo "command_id=$CMD_ID" >> $GITHUB_OUTPUT
+          echo "SSM Command ID: $CMD_ID"
+
+      - name: Esperar resultado (máx 5 min)
+        run: |
+          for i in $(seq 1 30); do
+            STATUS=$(aws ssm get-command-invocation \
+              --command-id "${{ steps.ssm-cmd.outputs.command_id }}" \
+              --instance-id "${{ steps.get-instance.outputs.instance_id }}" \
+              --query "Status" --output text 2>/dev/null || echo "Pending")
+            echo "Intento $i/30 — $STATUS"
+            if [ "$STATUS" = "Success" ]; then
+              aws ssm get-command-invocation \
+                --command-id "${{ steps.ssm-cmd.outputs.command_id }}" \
+                --instance-id "${{ steps.get-instance.outputs.instance_id }}" \
+                --query "StandardOutputContent" --output text
+              exit 0
+            fi
+            if [ "$STATUS" = "Failed" ] || [ "$STATUS" = "TimedOut" ] || [ "$STATUS" = "Cancelled" ]; then
+              aws ssm get-command-invocation \
+                --command-id "${{ steps.ssm-cmd.outputs.command_id }}" \
+                --instance-id "${{ steps.get-instance.outputs.instance_id }}" \
+                --query "StandardErrorContent" --output text
+              exit 1
+            fi
+            sleep 10
+          done
+          exit 1
